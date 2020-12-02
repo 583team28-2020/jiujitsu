@@ -7,6 +7,9 @@
 #include "llvm/ExecutionEngine/Orc/IRTransformLayer.h"
 #include "llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h"
 #include "llvm/ExecutionEngine/Orc/RTDyldObjectLinkingLayer.h"
+#include "llvm/ExecutionEngine/Orc/TargetProcessControl.h"
+#include "llvm/ExecutionEngine/Orc/TPCIndirectionUtils.h"
+#include "llvm/ExecutionEngine/Orc/CompileOnDemandLayer.h"
 #include "llvm/ExecutionEngine/SectionMemoryManager.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/LLVMContext.h"
@@ -41,7 +44,10 @@ namespace orc {
 
 class JIT {
 private:
-  ExecutionSession ES;
+  std::unique_ptr<ExecutionSession> ES;
+
+  std::unique_ptr<TargetProcessControl> TPC;
+  std::unique_ptr<TPCIndirectionUtils> TPCIU;
 
   DataLayout DL;
   MangleAndInterner Mangle;
@@ -49,6 +55,7 @@ private:
   RTDyldObjectLinkingLayer ObjectLayer;
   IRCompileLayer CompileLayer;
   IRTransformLayer TransformLayer;
+  CompileOnDemandLayer CODLayer;
   ThreadSafeContext Ctx;
 
   JITDylib& MainJD;
@@ -68,15 +75,25 @@ private:
 
     return M;
   }
+  
+  static void handleLazyCallThroughError() {
+    errs() << "LazyCallThrough error: Could not find function body";
+    exit(1);
+  }
 
 public:
-  JIT(JITTargetMachineBuilder JTMB, DataLayout DL)
-      : ObjectLayer(ES,
-                    []() { return std::make_unique<SectionMemoryManager>(); }),
+  JIT(std::unique_ptr<ExecutionSession> ES, std::unique_ptr<TargetProcessControl> TPC, std::unique_ptr<TPCIndirectionUtils> TPCIU, JITTargetMachineBuilder JTMB, DataLayout DL)
+      : ES(std::move(ES),
+        ObjectLayer(ES,
+          []() { return std::make_unique<SectionMemoryManager>(); }),
         CompileLayer(ES, ObjectLayer, std::make_unique<ConcurrentIRCompiler>(std::move(JTMB))),
         TransformLayer(ES, CompileLayer, optimizeModule),
+        TPC(std::move(TPC)), TPCIU(std::move(TPCIU)),
         DL(std::move(DL)), Mangle(ES, this->DL),
         Ctx(std::make_unique<LLVMContext>()),
+        CODLayer(*this->ES, OptimizeLayer,
+                 this->TPCIU->getLazyCallThroughManager(),
+                 [this] { return this->TPCIU->createIndirectStubsManager(); }),
         MainJD(ES.createJITDylib("main")) {
     MainJD.addGenerator(
         cantFail(DynamicLibrarySearchGenerator::GetForCurrentProcess('_')));
@@ -92,9 +109,22 @@ public:
   }
 
   static Expected<std::unique_ptr<JIT>> Create() {
-    auto ES = std::make_unique<ExecutionSession>();
+    auto SSP = std::make_shared<SymbolStringPool>();
+    auto TPC = SelfTargetProcessControl::Create(SSP);
+    if (!TPC)
+      return TPC.takeError();
+    auto ES = std::make_unique<ExecutionSession>(SSP);
+    auto TPCIU = TPCIndirectionUtils::Create(**TPC);
+    if (!TPCIU)
+      return TPCIU.takeError();
+    
+    (*TPCIU)->createLazyCallThroughManager(
+        *ES, pointerToJITTargetAddress(&handleLazyCallThroughError));
 
-    auto JTMB = JITTargetMachineBuilder::detectHost();
+    if (auto Err = setUpInProcessLCTMReentryViaTPCIU(**TPCIU))
+      return std::move(Err);
+
+    JITTargetMachineBuilder JTMB((*TPC)->getTargetTriple());
     if (!JTMB)
       return JTMB.takeError();
 
@@ -102,7 +132,7 @@ public:
     if (!DL)
       return DL.takeError();
 
-    return std::make_unique<JIT>(std::move(*JTMB), std::move(*DL));
+    return std::make_unique<JIT>(std::move(ES), std::move(TPC), std::move(TPCIU), std::move(*JTMB), std::move(*DL));
   }
 
   // void addLibrary(const char* fileName) {
