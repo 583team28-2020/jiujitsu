@@ -19,6 +19,7 @@
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/Constants.h>
+#include "specializer.h"
 
 namespace llvm {
 
@@ -46,10 +47,14 @@ public:
   PrintVisitorPass(): FunctionPass(pid) {}
 
   bool runOnFunction(Function& f) override {
+    int i = 0;
     outs() << "Compiling function: " << f.getName() << "\n";
+    for (auto& arg : f.args()) {
+      outs() << " - Arg " << arg.getArgNo() << " : ";
+      arg.getType()->print(outs());
+      outs() << "\n";
+    }
     f.print(outs());
-    outs() << "\n";
-    outs().flush();
     return true;
   }
 };
@@ -79,7 +84,7 @@ private:
 
     // Add some optimizations.
     FPM->add(new PrintVisitorPass());
-    // FPM->add(new HelloWorldPass());
+    FPM->add(new HelloWorldPass());
     FPM->doInitialization();
 
     // Run the optimizations over all functions in the module being added to
@@ -93,12 +98,6 @@ private:
   static void handleLazyCallThroughError() {
     errs() << "LazyCallThrough error: Could not find function body";
     exit(1);
-  }
-
-  static JITTargetAddress landTrampoline(JITTargetAddress addr) {
-    outs() << "Landed trampoline from address " << addr << "\n";
-    outs().flush();
-    return addr;
   }
 
 public:
@@ -116,6 +115,7 @@ public:
         MainJD(this->ES->createJITDylib("main")) {
     MainJD.addGenerator(
         cantFail(DynamicLibrarySearchGenerator::GetForCurrentProcess('_')));
+    CODLayer.setPartitionFunction(CompileOnDemandLayer::compileRequested); // Compile functions individually, only when they are needed.
     // SymbolMap syms;
     // syms[Mangle("puts")] = JITEvaluatedSymbol(
     //     pointerToJITTargetAddress(&puts), JITSymbolFlags());
@@ -154,7 +154,9 @@ public:
   const DataLayout &getDataLayout() const { return DL; }
 
   Error addModule(ThreadSafeModule&& TSM) {
-    return TransformLayer.add(MainJD, std::move(TSM));
+    for (auto& fn : TSM.getModuleUnlocked()->getFunctionList())
+      TrackSymbol(fn.getName());
+    return CODLayer.add(MainJD, std::move(TSM));
   }
 
   Expected<JITEvaluatedSymbol> lookup(StringRef Name) {
@@ -185,6 +187,7 @@ int main(int argc, char** argv) {
       errs() << "Error adding module.\n";
       return 1;
     }
+    LogSymbols(outs());
     auto* main = (int(*)(int, char*[]))jit->lookup("main").get().getAddress();
 
     char args[] = "<main>";

@@ -1,9 +1,13 @@
 #include "stdio.h"
 
-int fn() {
-    return 3;
+int unused() {
+    return 2;
+}
+
+int fn(int n) {
+    return n + 3; 
 }
 
 int main() {
-    return fn();
+    return fn(2);
 }

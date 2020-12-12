@@ -1,3 +1,4 @@
 .vscode/
 jiujitsu
 *.o
+hash_test*
