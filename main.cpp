@@ -1,16 +1,16 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ExecutionEngine/JITSymbol.h"
 #include "llvm/ExecutionEngine/Orc/CompileUtils.h"
+#include "llvm/ExecutionEngine/Orc/OrcABISupport.h"
 #include "llvm/ExecutionEngine/Orc/Core.h"
-#include "llvm/ExecutionEngine/Orc/ExecutionUtils.h"
 #include "llvm/ExecutionEngine/Orc/IRCompileLayer.h"
 #include "llvm/ExecutionEngine/Orc/IRTransformLayer.h"
 #include "llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h"
 #include "llvm/ExecutionEngine/Orc/RTDyldObjectLinkingLayer.h"
-#include "llvm/ExecutionEngine/Orc/TargetProcessControl.h"
-#include "llvm/ExecutionEngine/Orc/TPCIndirectionUtils.h"
-#include "llvm/ExecutionEngine/Orc/CompileOnDemandLayer.h"
 #include "llvm/ExecutionEngine/SectionMemoryManager.h"
+#include "llvm/ExecutionEngine/Orc/IndirectionUtils.h"
+#include "llvm/ExecutionEngine/Orc/ExecutionUtils.h"
+#include "llvm/ExecutionEngine/Orc/CompileOnDemandLayer.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/LLVMContext.h"
 #include <llvm/IR/Module.h>
@@ -45,10 +45,9 @@ namespace orc {
 class JIT {
 private:
   std::unique_ptr<ExecutionSession> ES;
+  std::unique_ptr<LazyCallThroughManager> LCM;
 
-  std::unique_ptr<TargetProcessControl> TPC;
-  std::unique_ptr<TPCIndirectionUtils> TPCIU;
-
+  Triple triple;
   DataLayout DL;
   MangleAndInterner Mangle;
 
@@ -81,20 +80,25 @@ private:
     exit(1);
   }
 
+  static JITTargetAddress landTrampoline(JITTargetAddress addr) {
+    outs() << "Landed trampoline from address " << addr << "\n";
+    outs().flush();
+    return addr;
+  }
+
 public:
-  JIT(std::unique_ptr<ExecutionSession> ES, std::unique_ptr<TargetProcessControl> TPC, std::unique_ptr<TPCIndirectionUtils> TPCIU, JITTargetMachineBuilder JTMB, DataLayout DL)
-      : ES(std::move(ES),
-        ObjectLayer(ES,
+  JIT(std::unique_ptr<ExecutionSession> ES, JITTargetMachineBuilder JTMB, DataLayout DL, const Triple& T, std::unique_ptr<LazyCallThroughManager>&& lcm)
+      : ES(std::move(ES)),
+        ObjectLayer(*ES,
           []() { return std::make_unique<SectionMemoryManager>(); }),
-        CompileLayer(ES, ObjectLayer, std::make_unique<ConcurrentIRCompiler>(std::move(JTMB))),
-        TransformLayer(ES, CompileLayer, optimizeModule),
-        TPC(std::move(TPC)), TPCIU(std::move(TPCIU)),
-        DL(std::move(DL)), Mangle(ES, this->DL),
+        CompileLayer(*ES, ObjectLayer, std::make_unique<ConcurrentIRCompiler>(JTMB)),
+        TransformLayer(*ES, CompileLayer, optimizeModule),
+        DL(std::move(DL)), Mangle(*ES, this->DL),
+        triple(T),
+        LCM(std::move(lcm)),
         Ctx(std::make_unique<LLVMContext>()),
-        CODLayer(*this->ES, OptimizeLayer,
-                 this->TPCIU->getLazyCallThroughManager(),
-                 [this] { return this->TPCIU->createIndirectStubsManager(); }),
-        MainJD(ES.createJITDylib("main")) {
+        CODLayer(*ES, TransformLayer, *LCM, createLocalIndirectStubsManagerBuilder(triple)),
+        MainJD(ES->createJITDylib("main")) {
     MainJD.addGenerator(
         cantFail(DynamicLibrarySearchGenerator::GetForCurrentProcess('_')));
     // SymbolMap syms;
@@ -110,21 +114,9 @@ public:
 
   static Expected<std::unique_ptr<JIT>> Create() {
     auto SSP = std::make_shared<SymbolStringPool>();
-    auto TPC = SelfTargetProcessControl::Create(SSP);
-    if (!TPC)
-      return TPC.takeError();
     auto ES = std::make_unique<ExecutionSession>(SSP);
-    auto TPCIU = TPCIndirectionUtils::Create(**TPC);
-    if (!TPCIU)
-      return TPCIU.takeError();
-    
-    (*TPCIU)->createLazyCallThroughManager(
-        *ES, pointerToJITTargetAddress(&handleLazyCallThroughError));
 
-    if (auto Err = setUpInProcessLCTMReentryViaTPCIU(**TPCIU))
-      return std::move(Err);
-
-    JITTargetMachineBuilder JTMB((*TPC)->getTargetTriple());
+    auto JTMB = JITTargetMachineBuilder::detectHost();
     if (!JTMB)
       return JTMB.takeError();
 
@@ -132,22 +124,26 @@ public:
     if (!DL)
       return DL.takeError();
 
-    return std::make_unique<JIT>(std::move(ES), std::move(TPC), std::move(TPCIU), std::move(*JTMB), std::move(*DL));
+    auto LCM = createLocalLazyCallThroughManager(JTMB->getTargetTriple(), *ES, pointerToJITTargetAddress(handleLazyCallThroughError));
+    if (!LCM)
+      return LCM.takeError();
+
+    return std::make_unique<JIT>(std::move(ES), std::move(*JTMB), std::move(*DL), JTMB->getTargetTriple(), std::move(*LCM));
   }
 
-  // void addLibrary(const char* fileName) {
-  //   MainJD.addGenerator(cantFail(
-  //     DynamicLibrarySearchGenerator::Load(fileName, '_', [](auto sym) -> bool { return true; })));
-  // }
+  void addLibrary(const char* fileName) {
+    MainJD.addGenerator(cantFail(
+      DynamicLibrarySearchGenerator::Load(fileName, DL.getGlobalPrefix(), [](auto sym) -> bool { return true; })));
+  }
 
   const DataLayout &getDataLayout() const { return DL; }
 
   Error addModule(ThreadSafeModule&& TSM) {
-    return TransformLayer.add(MainJD, std::move(TSM));
+    return CODLayer.add(MainJD, std::move(TSM));
   }
 
   Expected<JITEvaluatedSymbol> lookup(StringRef Name) {
-    return ES.lookup({&MainJD}, Mangle(Name.str()));
+    return ES->lookup({&MainJD}, Mangle(Name.str()));
   }
 };
 
@@ -170,7 +166,10 @@ int main(int argc, char** argv) {
     if (!optionaljit)
       outs() << optionaljit.takeError() << "\n";
     auto jit = move(optionaljit.get());
-    jit->addModule(std::move(*tsm));
+    if (Error e = jit->addModule(std::move(*tsm))) {
+      errs() << "Error adding module.\n";
+      return 1;
+    }
     auto* main = (int(*)(int, char*[]))jit->lookup("main").get().getAddress();
 
     char args[] = "<main>";
