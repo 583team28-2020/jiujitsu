@@ -40,6 +40,20 @@ public:
   }
 };
 
+class PrintVisitorPass : public FunctionPass {
+  char pid = 75;
+public:
+  PrintVisitorPass(): FunctionPass(pid) {}
+
+  bool runOnFunction(Function& f) override {
+    outs() << "Compiling function: " << f.getName() << "\n";
+    f.print(outs());
+    outs() << "\n";
+    outs().flush();
+    return true;
+  }
+};
+
 namespace orc {
 
 class JIT {
@@ -64,7 +78,8 @@ private:
     auto FPM = std::make_unique<legacy::FunctionPassManager>(M.getModuleUnlocked());
 
     // Add some optimizations.
-    FPM->add(new HelloWorldPass());
+    FPM->add(new PrintVisitorPass());
+    // FPM->add(new HelloWorldPass());
     FPM->doInitialization();
 
     // Run the optimizations over all functions in the module being added to
@@ -89,16 +104,16 @@ private:
 public:
   JIT(std::unique_ptr<ExecutionSession> ES, JITTargetMachineBuilder JTMB, DataLayout DL, const Triple& T, std::unique_ptr<LazyCallThroughManager>&& lcm)
       : ES(std::move(ES)),
-        ObjectLayer(*ES,
+        ObjectLayer(*this->ES,
           []() { return std::make_unique<SectionMemoryManager>(); }),
-        CompileLayer(*ES, ObjectLayer, std::make_unique<ConcurrentIRCompiler>(JTMB)),
-        TransformLayer(*ES, CompileLayer, optimizeModule),
-        DL(std::move(DL)), Mangle(*ES, this->DL),
+        CompileLayer(*this->ES, ObjectLayer, std::make_unique<ConcurrentIRCompiler>(JTMB)),
+        TransformLayer(*this->ES, CompileLayer, optimizeModule),
+        DL(std::move(DL)), Mangle(*this->ES, this->DL),
         triple(T),
         LCM(std::move(lcm)),
         Ctx(std::make_unique<LLVMContext>()),
-        CODLayer(*ES, TransformLayer, *LCM, createLocalIndirectStubsManagerBuilder(triple)),
-        MainJD(ES->createJITDylib("main")) {
+        CODLayer(*this->ES, TransformLayer, *LCM, createLocalIndirectStubsManagerBuilder(triple)),
+        MainJD(this->ES->createJITDylib("main")) {
     MainJD.addGenerator(
         cantFail(DynamicLibrarySearchGenerator::GetForCurrentProcess('_')));
     // SymbolMap syms;
@@ -114,7 +129,7 @@ public:
 
   static Expected<std::unique_ptr<JIT>> Create() {
     auto SSP = std::make_shared<SymbolStringPool>();
-    auto ES = std::make_unique<ExecutionSession>(SSP);
+    auto ES = std::make_unique<ExecutionSession>(std::move(SSP));
 
     auto JTMB = JITTargetMachineBuilder::detectHost();
     if (!JTMB)
@@ -139,7 +154,7 @@ public:
   const DataLayout &getDataLayout() const { return DL; }
 
   Error addModule(ThreadSafeModule&& TSM) {
-    return CODLayer.add(MainJD, std::move(TSM));
+    return TransformLayer.add(MainJD, std::move(TSM));
   }
 
   Expected<JITEvaluatedSymbol> lookup(StringRef Name) {
