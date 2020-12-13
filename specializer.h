@@ -44,6 +44,15 @@ void TrackSymbol(llvm::StringRef str);
 // lookup tables as simple int-to-int maps, which permits for optimization.
 extern "C" llvm::JITTargetAddress JITResolveCall(llvm::JITTargetAddress fn, llvm::JITTargetAddress arg);
 
+// Adds JIT implementation functions to a module.
+void declareInternalFunctions(llvm::LLVMContext& ctx, llvm::Module* module);
+
+// Adds JIT implementation functions to dynamic linker.
+void addInternalFunctions(llvm::orc::MangleAndInterner& mangle, llvm::orc::SymbolMap& map);
+
+// Compiles a function specialized on a particular input.
+llvm::JITTargetAddress compileSpecialized(llvm::Function* function, llvm::JITTargetAddress arg);
+
 // Inserts trampolines into functions. Transforms all function calls to active module functions
 // into indirect calls, using the JITResolveCall function to resolve the address prior to invocation.
 class InstrumentationPass : public llvm::FunctionPass {

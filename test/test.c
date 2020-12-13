@@ -9,5 +9,8 @@ int fn(int n) {
 }
 
 int main() {
-    return fn(2);
+    int i = fn(2);
+    int j = fn(3);
+    int k = fn(4);
+    return i + j + k;
 }

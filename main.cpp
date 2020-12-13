@@ -29,14 +29,14 @@ public:
   HelloWorldPass(): FunctionPass(pid) {}
 
   bool runOnFunction(Function &f) override {
-    for (BasicBlock& bb : f) {
-      for (Instruction& i : bb) {
-        for (int j = 0; j < i.getNumOperands(); j ++) {
-          Value* value = i.getOperand(j);
-          if (isa<ConstantInt>(value)) i.setOperand(j, ConstantInt::getSigned(IntegerType::get(f.getContext(), 32), 9));
-        }
-      }
-    }
+    if (f.arg_begin() == f.arg_end()) return true;
+
+    int a = 20; // Value to replace with
+    Value* arg = nullptr;
+    arg = dyn_cast<Value>(f.arg_begin());
+    ConstantInt* const_val = llvm::ConstantInt::get(f.getContext(), llvm::APInt(/*nbits*/32, a, /*bool*/false));
+    outs() << "Constant val: " << *const_val << "\n";
+    arg->replaceAllUsesWith(const_val);
     return true;
   }
 };
@@ -83,8 +83,9 @@ private:
     auto FPM = std::make_unique<legacy::FunctionPassManager>(M.getModuleUnlocked());
 
     // Add some optimizations.
-    FPM->add(new PrintVisitorPass());
-    FPM->add(new HelloWorldPass());
+    FPM->add(new InstrumentationPass());
+    // FPM->add(new PrintVisitorPass());
+    // FPM->add(new HelloWorldPass());
     FPM->doInitialization();
 
     // Run the optimizations over all functions in the module being added to
@@ -115,6 +116,9 @@ public:
         MainJD(this->ES->createJITDylib("main")) {
     MainJD.addGenerator(
         cantFail(DynamicLibrarySearchGenerator::GetForCurrentProcess('_')));
+    SymbolMap syms;
+    addInternalFunctions(Mangle, syms);
+    cantFail(MainJD.define(absoluteSymbols(syms)));
     CODLayer.setPartitionFunction(CompileOnDemandLayer::compileRequested); // Compile functions individually, only when they are needed.
     // SymbolMap syms;
     // syms[Mangle("puts")] = JITEvaluatedSymbol(
@@ -177,6 +181,7 @@ int main(int argc, char** argv) {
     std::unique_ptr<LLVMContext> context = std::make_unique<LLVMContext>();
     SMDiagnostic error;
     auto module = parseIRFile(argv[1], error, *context);
+    declareInternalFunctions(*context, module.get());
     auto tsm = std::make_unique<ThreadSafeModule>(move(module), move(context));
 
     auto optionaljit = JIT::Create();
@@ -187,7 +192,7 @@ int main(int argc, char** argv) {
       errs() << "Error adding module.\n";
       return 1;
     }
-    LogSymbols(outs());
+    // LogSymbols(outs());
     auto* main = (int(*)(int, char*[]))jit->lookup("main").get().getAddress();
 
     char args[] = "<main>";
