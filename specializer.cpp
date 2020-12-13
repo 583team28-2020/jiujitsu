@@ -42,17 +42,17 @@ extern "C" JITTargetAddress JITResolveCall(JITTargetAddress fn, JITTargetAddress
     }
 
     intmap& curr_func = func_counter[fn];
-    intmap::const_iterator curr_elm = curr_func.find(arg);
-    
-    // if optimized, run that instead
-    if ((*curr_elm).second > SPECIALIZATION_THRESHOLD) {
-        return (*curr_elm).second;
-    }
+    intmap::const_iterator curr_elm = curr_func.find(arg);    
 
     uint64_t num_calls;
     if (curr_elm == curr_func.end()) {
         num_calls = 1;
     } else {
+        // if optimized, run that instead
+        if ((*curr_elm).second > SPECIALIZATION_THRESHOLD) {
+            return (*curr_elm).second;
+        }
+
         num_calls = (*curr_elm).second + 1;
     }
 
