@@ -22,7 +22,7 @@
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/Constants.h>
 
-#define SPECIALIZATION_THRESHOLD 100
+#define SPECIALIZATION_THRESHOLD 1
 
 // Logs all symbols currently tracked by the specializer.
 void LogSymbols(llvm::raw_ostream& io);
@@ -45,13 +45,26 @@ void TrackSymbol(llvm::StringRef str);
 extern "C" llvm::JITTargetAddress JITResolveCall(llvm::JITTargetAddress fn, llvm::JITTargetAddress arg);
 
 // Adds JIT implementation functions to a module.
-void declareInternalFunctions(llvm::LLVMContext& ctx, llvm::Module* module);
+void DeclareInternalFunctions(llvm::LLVMContext& ctx, llvm::Module* module);
 
 // Adds JIT implementation functions to dynamic linker.
-void addInternalFunctions(llvm::orc::MangleAndInterner& mangle, llvm::orc::SymbolMap& map);
+void AddInternalFunctions(llvm::orc::MangleAndInterner& mangle, llvm::orc::SymbolMap& map);
+
+// Initializes specializer with module and other info.
+void InitSpecializer(llvm::orc::ThreadSafeModule& module, llvm::orc::JITDylib* dylib, llvm::orc::IRCompileLayer* cl, llvm::orc::ThreadSafeContext ctx);
 
 // Compiles a function specialized on a particular input.
-llvm::JITTargetAddress compileSpecialized(llvm::Function* function, llvm::JITTargetAddress arg);
+llvm::JITTargetAddress CompileFunction(llvm::Function* function, llvm::JITTargetAddress arg);
+
+// Specializes the provided function on a particular argument.
+class SpecializationPass : public llvm::FunctionPass {
+  char pid = 74;
+  llvm::JITTargetAddress arg;
+public:
+  SpecializationPass();
+  void setValue(llvm::JITTargetAddress arg_in);
+  bool runOnFunction(llvm::Function &f) override;
+};
 
 // Inserts trampolines into functions. Transforms all function calls to active module functions
 // into indirect calls, using the JITResolveCall function to resolve the address prior to invocation.
