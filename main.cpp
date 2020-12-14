@@ -57,7 +57,7 @@ private:
 
   RTDyldObjectLinkingLayer ObjectLayer;
   IRCompileLayer CompileLayer, SpecializeCompileLayer;
-  IRTransformLayer TransformLayer;
+  IRTransformLayer TransformLayer, SpecializeTransformLayer;
   CompileOnDemandLayer CODLayer;
   ThreadSafeContext Ctx;
 
@@ -92,8 +92,9 @@ public:
         ObjectLayer(*this->ES,
           []() { return std::make_unique<SectionMemoryManager>(); }),
         CompileLayer(*this->ES, ObjectLayer, std::make_unique<ConcurrentIRCompiler>(JTMB)),
-        SpecializeCompileLayer(*this->ES, ObjectLayer, std::make_unique<ConcurrentIRCompiler>(JTMB)),
         TransformLayer(*this->ES, CompileLayer, optimizeModule),
+        SpecializeCompileLayer(*this->ES, ObjectLayer, std::make_unique<ConcurrentIRCompiler>(JTMB)),
+        SpecializeTransformLayer(*this->ES, SpecializeCompileLayer, specializeModule),
         DL(std::move(DL)), Mangle(*this->ES, this->DL),
         triple(T),
         LCM(std::move(lcm)),
@@ -144,9 +145,11 @@ public:
   const DataLayout &getDataLayout() const { return DL; }
 
   Error addModule(ThreadSafeModule&& TSM) {
-    for (auto& fn : TSM.getModuleUnlocked()->getFunctionList())
+    for (auto& fn : TSM.getModuleUnlocked()->getFunctionList()) {
       TrackSymbol(fn.getName());
-    InitSpecializer(TSM.getModuleUnlocked(), &MainJD, &SpecializeCompileLayer, TSC);
+      DefineFunction(fn.getName(), &fn);
+    }
+    InitSpecializer(TSM, &MainJD, &SpecializeTransformLayer, TSC);
     return CODLayer.add(MainJD, std::move(TSM));
   }
 

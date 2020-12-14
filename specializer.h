@@ -32,6 +32,11 @@ void LogSymbols(llvm::raw_ostream& io);
 // in the instrumentation pass.
 void TrackSymbol(llvm::StringRef str);
 
+// Defines a function for a particular name.
+void DefineFunction(llvm::StringRef str, llvm::Function* fn);
+
+llvm::Expected<llvm::orc::ThreadSafeModule> specializeModule(llvm::orc::ThreadSafeModule M, const llvm::orc::MaterializationResponsibility &R);
+
 // Returns the address of the function specialized for the given argument. Has three effects:
 //  1. If the function is specialized on the argument, the count will be an address, numerically
 //     greater than the specialization threshold. Return this address and do not modify the count.
@@ -51,7 +56,7 @@ void DeclareInternalFunctions(llvm::LLVMContext& ctx, llvm::Module* module);
 void AddInternalFunctions(llvm::orc::MangleAndInterner& mangle, llvm::orc::SymbolMap& map);
 
 // Initializes specializer with module and other info.
-void InitSpecializer(llvm::orc::ThreadSafeModule& module, llvm::orc::JITDylib* dylib, llvm::orc::IRCompileLayer* cl, llvm::orc::ThreadSafeContext ctx);
+void InitSpecializer(llvm::orc::ThreadSafeModule& module, llvm::orc::JITDylib* dylib, llvm::orc::IRTransformLayer* cl, llvm::orc::ThreadSafeContext ctx);
 
 // Compiles a function specialized on a particular input.
 llvm::JITTargetAddress CompileFunction(llvm::Function* function, llvm::JITTargetAddress arg);
