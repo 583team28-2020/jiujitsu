@@ -46,6 +46,24 @@ public:
 
 namespace orc {
 
+class CustomObjectLayer : public RTDyldObjectLinkingLayer {
+  static void onLoaded(VModuleKey, const object::ObjectFile& obj,
+                         const RuntimeDyld::LoadedObjectInfo& info) {
+    for (const auto& sym : obj.symbols()) {
+      auto sec = cantFail(sym.getSection());
+      if (sec != obj.section_end()) {
+        uint64_t sectionAddr = info.getSectionLoadAddress(*sec);
+        outs() << " - loaded " << cantFail(sym.getName()) << " : " << (void*)(sectionAddr + sym.getValue()) << "\n";
+      }
+    }
+  }
+public:
+  CustomObjectLayer(ExecutionSession& ES, GetMemoryManagerFunction fn):
+    RTDyldObjectLinkingLayer(ES, fn) {
+    setNotifyLoaded(onLoaded);
+  }
+};
+
 class JIT {
 private:
   std::unique_ptr<ExecutionSession> ES;
@@ -55,7 +73,7 @@ private:
   DataLayout DL;
   MangleAndInterner Mangle;
 
-  RTDyldObjectLinkingLayer ObjectLayer;
+  CustomObjectLayer ObjectLayer;
   IRCompileLayer CompileLayer, SpecializeCompileLayer;
   IRTransformLayer TransformLayer, SpecializeTransformLayer;
   CompileOnDemandLayer CODLayer;
@@ -69,8 +87,6 @@ private:
 
     // Add some optimizations.
     FPM->add(new InstrumentationPass());
-    // FPM->add(new PrintVisitorPass());
-    // FPM->add(new HelloWorldPass());
     FPM->doInitialization();
 
     // Run the optimizations over all functions in the module being added to
@@ -149,7 +165,7 @@ public:
       TrackSymbol(fn.getName());
       DefineFunction(fn.getName(), &fn);
     }
-    InitSpecializer(TSM, &MainJD, &SpecializeTransformLayer, TSC);
+    InitSpecializer(&MainJD, &SpecializeTransformLayer, TSC);
     return CODLayer.add(MainJD, std::move(TSM));
   }
 
@@ -165,6 +181,7 @@ using namespace llvm::orc;
 using namespace llvm;
 
 int main(int argc, char** argv) {
+    ::llvm::DebugFlag = true;
     InitializeNativeTarget();
     InitializeNativeTargetAsmPrinter();
 

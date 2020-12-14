@@ -56,7 +56,7 @@ void DeclareInternalFunctions(llvm::LLVMContext& ctx, llvm::Module* module);
 void AddInternalFunctions(llvm::orc::MangleAndInterner& mangle, llvm::orc::SymbolMap& map);
 
 // Initializes specializer with module and other info.
-void InitSpecializer(llvm::orc::ThreadSafeModule& module, llvm::orc::JITDylib* dylib, llvm::orc::IRTransformLayer* cl, llvm::orc::ThreadSafeContext ctx);
+void InitSpecializer(llvm::orc::JITDylib* dylib, llvm::orc::IRTransformLayer* cl, llvm::orc::ThreadSafeContext ctx);
 
 // Compiles a function specialized on a particular input.
 llvm::JITTargetAddress CompileFunction(llvm::Function* function, llvm::JITTargetAddress arg);

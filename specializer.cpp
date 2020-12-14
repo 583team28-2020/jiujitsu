@@ -63,8 +63,11 @@ extern "C" JITTargetAddress JITResolveCall(JITTargetAddress fn, JITTargetAddress
 
     // param used a lot, optimize it and use it
     if (num_calls >= SPECIALIZATION_THRESHOLD) {
-        num_calls = CompileFunction(function_ir["fn"], arg);
-        fn = num_calls;
+        num_calls = fn = CompileFunction(function_ir["fn"], arg);
+        if (!fn) {
+            DYLIB->dump(errs());
+            errs() << "Failed to compile function!\n";
+        }
     }
     
     curr_func.emplace(arg, num_calls);
@@ -82,8 +85,11 @@ void DeclareInternalFunctions(llvm::LLVMContext& ctx, Module* module) {
     );
 }
 
+static MangleAndInterner* MANGLE = nullptr;
+
 // Adds JIT implementation functions to dynamic linker.
 void AddInternalFunctions(MangleAndInterner& mangle, SymbolMap& map) {
+    MANGLE = &mangle;
     map[mangle("JITResolveCall")] = JITEvaluatedSymbol(pointerToJITTargetAddress(&JITResolveCall), {});
 }
 
@@ -100,11 +106,6 @@ int findSpecializedArg(Function* fn) {
 
 // static std::unique_ptr<legacy::FunctionPassManager> FPM = nullptr;
 
-// class SpecializingMaterializationUnit : public MaterializationUnit {
-// public:
-
-// };
-
 // 1. Create function pass manager if absent.
 // 2. Set argument parameter in specialization pass.
 // 3. Clone function, change name to specialized one. (?)
@@ -114,90 +115,83 @@ int findSpecializedArg(Function* fn) {
 
 // SpecializationPass* SPECIALIZE = nullptr;
 
-void InitSpecializer(ThreadSafeModule& module, JITDylib* dylib, IRTransformLayer* tl, ThreadSafeContext ctx) {
+static IRTransformLayer* SPECIALIZE_TRANSFORM = nullptr;
+static ThreadSafeContext CTX;
+
+void InitSpecializer(JITDylib* dylib, IRTransformLayer* tl, ThreadSafeContext ctx) {
     DYLIB = dylib;
-    auto fn_module = CloneModule(*module.getModuleUnlocked());
-    fn_module->setModuleIdentifier(module.getModuleUnlocked()->getModuleIdentifier() + "_specialized");
-    outs() << "original module:\n";
-    module.getModuleUnlocked()->print(outs(), nullptr);
-    outs() << "copied module:\n";
-    fn_module->print(outs(), nullptr);
-    auto tsm = ThreadSafeModule(std::move(fn_module), ctx);
+    CTX = ctx;
     SPECIALIZE = new SpecializationPass();
-    Error e = tl->add(*DYLIB, move(tsm));
-    if (e) {
-        errs() << "Error adding specializer module to transform layer.\n";
-    }
+    SPECIALIZE_TRANSFORM = tl;
 }
 
-// class SpecializedMaterializationUnit : public MaterializationUnit {
-//     static SymbolFlagsMap getSymbolMap(const std::string& name) {
-//         SymbolFlagsMap map;
-//         map.insert({ DYLIB->getExecutionSession().getSymbolStringPool()->intern(name), JITSymbolFlags()});
-//         return map;
-//     }
-// public:
-//     SpecializedMaterializationUnit(const std::string& name, IRCompileLayer& CL): 
-//         MaterializationUnit(getSymbolMap(name), 0), CompileLayer(CL) {}
-
-//     StringRef getName() const override {
-//         return "SpecializedMaterializationUnit";
-//     }
-
-//     void materialize(MaterializationResponsibility R) override {
-//         CompileLayer.emit(std::move(R), ThreadSafeModule(;
-//     }
-// private:
-//     void discard(const JITDylib &JD, const SymbolStringPtr &Sym) override {
-//         llvm_unreachable("Specialized functions are not overridable");
-//     }
-
-//     IRCompileLayer& CompileLayer;
-// };
 llvm::Expected<llvm::orc::ThreadSafeModule> specializeModule(llvm::orc::ThreadSafeModule M, const llvm::orc::MaterializationResponsibility &R) {
-    // Create a function pass manager.
     auto FPM = std::make_unique<legacy::FunctionPassManager>(M.getModuleUnlocked());
-
-    // Add some optimizations.
     FPM->add(SPECIALIZE);
     FPM->doInitialization();
-
-    // Run the optimizations over all functions in the module being added to
-    // the JIT.
     for (auto &F : *M.getModuleUnlocked())
       FPM->run(F);
 
     return M;
 }
 
+class SpecializationMaterializer : public MaterializationUnit {
+    ThreadSafeModule tsm;
+    JITTargetAddress arg;
+
+    static SymbolFlagsMap getSymbolMap(const std::string& name) {
+        SymbolFlagsMap map;
+        map.insert({(*MANGLE)(name), JITSymbolFlags::Exported | JITSymbolFlags::Callable});
+        return map;
+    }
+public:
+    SpecializationMaterializer(const std::string& sym, ThreadSafeModule&& tsm_in, JITTargetAddress arg_in): 
+        MaterializationUnit(getSymbolMap(sym), 0), tsm(move(tsm_in)), arg(arg_in) {} 
+    
+    StringRef getName() const override {
+        return "SpecializationMaterializer";
+    }
+protected:
+    void materialize(MaterializationResponsibility R) override {
+        outs() << "materializing\n";
+        SPECIALIZE->setValue(arg);
+        SPECIALIZE_TRANSFORM->emit(std::move(R), std::move(tsm));
+    }
+    
+    void discard(const JITDylib &JD, const SymbolStringPtr &Name) override {
+        llvm_unreachable("Should not discard specialized functions.");
+    }
+};
+
 // Compiles a function specialized on a particular input.
 JITTargetAddress CompileFunction(Function* function, JITTargetAddress arg) {
-    std::string mangled = function->getName().str() + "(" + to_string((uint64_t)arg) + ")";
+    std::string mangled = function->getName().str() + "_" + to_string((uint64_t)arg);
+    ThreadSafeModule tsm(std::make_unique<Module>(mangled, *CTX.getContext()), CTX);
     
     std::vector<Type*> argts;
     for (const Argument &I : function->args())
       argts.push_back(I.getType());
     FunctionType *fty = FunctionType::get(function->getFunctionType()->getReturnType(),
                                       argts, function->getFunctionType()->isVarArg());
-    Function* copy = Function::Create(fty, Function::ExternalLinkage, mangled);
+    Function* copy = Function::Create(fty, Function::ExternalLinkage, mangled, tsm.getModuleUnlocked());
     ValueToValueMapTy vmap;
     Function::arg_iterator DestI = copy->arg_begin();
     for (const Argument & I : function->args())
-        if (vmap.count(&I) == 0) {     // Is this argument preserved?
-            DestI->setName(I.getName()); // Copy the name over...
-            vmap[&I] = &*DestI++;        // Add mapping to VMap
+        if (vmap.count(&I) == 0) {     
+            DestI->setName(I.getName()); 
+            vmap[&I] = &*DestI++;      
         }
     SmallVector<ReturnInst*, 8> returns;
     CloneFunctionInto(copy, function, vmap, true, returns);
 
-    SPECIALIZE->setValue(arg);
-    LLVMContext& ctx = copy->getContext();
-
-    // outs() << "Specialized function " << function->getName() << " for argument " << arg << "\n";
-    // copy->print(outs());
-
     ExecutionSession& ES = DYLIB->getExecutionSession();
-    auto sym = ES.lookup({DYLIB}, mangled);
+    auto def = DYLIB->define(std::make_unique<SpecializationMaterializer>(mangled, std::move(tsm), arg));
+    if (def) {
+        errs() << "Failed to define specialized function in dylib.\n";
+        return 0;
+    }
+
+    auto sym = ES.lookup({DYLIB}, (*MANGLE)(mangled));
     if (!sym) {
         errs() << "Failed to specialize function " << function->getName() << " for argument " << arg << "\n";
         return 0;
@@ -217,9 +211,10 @@ bool SpecializationPass::runOnFunction(Function &f) {
 
     Value* fnarg = nullptr;
     fnarg = dyn_cast<Value>(f.arg_begin());
-    ConstantInt* const_val = llvm::ConstantInt::get(f.getContext(), llvm::APInt(/*nbits*/32, arg, /*bool*/false));
-    outs() << "Constant val: " << *const_val << "\n";
+    ConstantInt* const_val = llvm::ConstantInt::get(f.getContext(), llvm::APInt(/*nbits*/fnarg->getType()->getScalarSizeInBits(), arg, /*bool*/false));
     fnarg->replaceAllUsesWith(const_val);
+    outs() << "Specialized function " << f.getName() << ":\n";
+    f.print(outs());
     return true;
 }
 
@@ -251,5 +246,5 @@ bool InstrumentationPass::runOnFunction(Function &f) {
             }
         }
     }
-    return true; // TODO
+    return true;
 }
