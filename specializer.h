@@ -22,7 +22,7 @@
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/Constants.h>
 
-#define SPECIALIZATION_THRESHOLD 1
+#define SPECIALIZATION_THRESHOLD 100
 
 // Logs all symbols currently tracked by the specializer.
 void LogSymbols(llvm::raw_ostream& io);
@@ -47,7 +47,7 @@ llvm::Expected<llvm::orc::ThreadSafeModule> specializeModule(llvm::orc::ThreadSa
 // Note that by reusing the count to store the specialized function pointer, we lose the ability to
 // profile functions that are already specialized. However, this allows us to implement all of our
 // lookup tables as simple int-to-int maps, which permits for optimization.
-extern "C" llvm::JITTargetAddress JITResolveCall(llvm::JITTargetAddress fn, llvm::JITTargetAddress arg);
+extern "C" llvm::JITTargetAddress JITResolveCall(llvm::JITTargetAddress fn, llvm::JITTargetAddress arg, const char* name);
 
 // Adds JIT implementation functions to a module.
 void DeclareInternalFunctions(llvm::LLVMContext& ctx, llvm::Module* module);
@@ -64,10 +64,10 @@ llvm::JITTargetAddress CompileFunction(llvm::Function* function, llvm::JITTarget
 // Specializes the provided function on a particular argument.
 class SpecializationPass : public llvm::FunctionPass {
   char pid = 74;
-  llvm::JITTargetAddress arg;
+  static llvm::JITTargetAddress arg;
 public:
   SpecializationPass();
-  void setValue(llvm::JITTargetAddress arg_in);
+  static void setValue(llvm::JITTargetAddress arg_in);
   bool runOnFunction(llvm::Function &f) override;
 };
 

@@ -3,6 +3,10 @@
 #include <unordered_set>
 #include "hash.h"
 #include "llvm/Transforms/Utils/Cloning.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Utils.h"
+#include "llvm/Transforms/Scalar/GVN.h"
 
 using namespace llvm;
 using namespace llvm::orc;
@@ -21,12 +25,12 @@ void LogSymbols(llvm::raw_ostream& io) {
 // active module. This means that calls to this function will be trampolined
 // in the instrumentation pass.
 void TrackSymbol(llvm::StringRef str) {
-    symbols.insert(str);
+    symbols.insert(str.str());
 }
 
 // Defines a function for a particular name.
 void DefineFunction(llvm::StringRef str, llvm::Function* fn) {
-    function_ir[str] = fn;
+    function_ir[str.str()] = fn;
 }
 
 static std::unordered_map<LLVMContext*, Function*> JIT_RESOLVE_DEFS;
@@ -44,8 +48,8 @@ static SpecializationPass* SPECIALIZE = nullptr;
 // Note that by reusing the count to store the specialized function pointer, we lose the ability to
 // profile functions that are already specialized. However, this allows us to implement all of our
 // lookup tables as simple int-to-int maps, which permits for optimization.
-extern "C" JITTargetAddress JITResolveCall(JITTargetAddress fn, JITTargetAddress arg) {
-    outs() << "Called function at address " << (void*)fn << " with specialized argument " << arg << "\n";
+extern "C" JITTargetAddress JITResolveCall(JITTargetAddress fn, JITTargetAddress arg, const char* name) {
+    // outs() << "Called function at address " << (void*)fn << " with specialized argument " << arg << "\n";
 
     intmap& curr_func = func_counter[fn];
     intmap::const_iterator curr_elm = curr_func.find(arg);
@@ -63,10 +67,13 @@ extern "C" JITTargetAddress JITResolveCall(JITTargetAddress fn, JITTargetAddress
 
     // param used a lot, optimize it and use it
     if (num_calls >= SPECIALIZATION_THRESHOLD) {
-        num_calls = fn = CompileFunction(function_ir["fn"], arg);
-        if (!fn) {
-            DYLIB->dump(errs());
-            errs() << "Failed to compile function!\n";
+        auto it = function_ir.find(name);
+        if (it != function_ir.end()) {
+            num_calls = fn = CompileFunction(function_ir["fn"], arg);
+            if (!fn) {
+                DYLIB->dump(errs());
+                errs() << "Failed to compile function!\n";
+            }
         }
     }
     
@@ -78,7 +85,7 @@ extern "C" JITTargetAddress JITResolveCall(JITTargetAddress fn, JITTargetAddress
 // Adds JIT implementation functions to a module.
 void DeclareInternalFunctions(llvm::LLVMContext& ctx, Module* module) {
     if (!JIT_RESOLVE_FN) JIT_RESOLVE_FN = Function::Create(
-        FunctionType::get(Type::getInt64Ty(ctx), { Type::getInt64Ty(ctx), Type::getInt64Ty(ctx) }, false), 
+        FunctionType::get(Type::getInt64Ty(ctx), { Type::getInt64Ty(ctx), Type::getInt64Ty(ctx), Type::getInt8PtrTy(ctx) }, false), 
         Function::ExternalLinkage, 
         "JITResolveCall", 
         module
@@ -104,17 +111,6 @@ int findSpecializedArg(Function* fn) {
     return -1;
 }
 
-// static std::unique_ptr<legacy::FunctionPassManager> FPM = nullptr;
-
-// 1. Create function pass manager if absent.
-// 2. Set argument parameter in specialization pass.
-// 3. Clone function, change name to specialized one. (?)
-// 4. Run specializing FPM over cloned function.
-// 5. Materialize the function. (how?)
-// 6. Lookup the specialized function name in the execution session, return address.
-
-// SpecializationPass* SPECIALIZE = nullptr;
-
 static IRTransformLayer* SPECIALIZE_TRANSFORM = nullptr;
 static ThreadSafeContext CTX;
 
@@ -127,10 +123,19 @@ void InitSpecializer(JITDylib* dylib, IRTransformLayer* tl, ThreadSafeContext ct
 
 llvm::Expected<llvm::orc::ThreadSafeModule> specializeModule(llvm::orc::ThreadSafeModule M, const llvm::orc::MaterializationResponsibility &R) {
     auto FPM = std::make_unique<legacy::FunctionPassManager>(M.getModuleUnlocked());
-    FPM->add(SPECIALIZE);
+    FPM->add(new SpecializationPass());
+    FPM->add(createInstructionCombiningPass());
+    FPM->add(createReassociatePass());
+    FPM->add(createGVNPass());
+    FPM->add(createCFGSimplificationPass());
+    FPM->add(createPromoteMemoryToRegisterPass());
+    FPM->add(createConstantPropagationPass());
+    FPM->add(createDeadCodeEliminationPass());
     FPM->doInitialization();
-    for (auto &F : *M.getModuleUnlocked())
+    for (auto &F : *M.getModuleUnlocked()) {
       FPM->run(F);
+      // F.print(outs());
+    }
 
     return M;
 }
@@ -138,22 +143,24 @@ llvm::Expected<llvm::orc::ThreadSafeModule> specializeModule(llvm::orc::ThreadSa
 class SpecializationMaterializer : public MaterializationUnit {
     ThreadSafeModule tsm;
     JITTargetAddress arg;
+    std::string name;
 
-    static SymbolFlagsMap getSymbolMap(const std::string& name) {
+    static SymbolFlagsMap getSymbolMap(SymbolStringPtr name) {
         SymbolFlagsMap map;
-        map.insert({(*MANGLE)(name), JITSymbolFlags::Exported | JITSymbolFlags::Callable});
+        map.insert({name, JITSymbolFlags::Exported | JITSymbolFlags::Callable});
         return map;
     }
 public:
-    SpecializationMaterializer(const std::string& sym, ThreadSafeModule&& tsm_in, JITTargetAddress arg_in): 
-        MaterializationUnit(getSymbolMap(sym), 0), tsm(move(tsm_in)), arg(arg_in) {} 
+    SpecializationMaterializer(SymbolStringPtr sym, ThreadSafeModule&& tsm_in, JITTargetAddress arg_in): 
+        MaterializationUnit(getSymbolMap(sym), sym, 0), tsm(move(tsm_in)), arg(arg_in) {
+        name = "Materializer_" + std::string(*sym);
+    } 
     
     StringRef getName() const override {
-        return "SpecializationMaterializer";
+        return name;
     }
 protected:
     void materialize(MaterializationResponsibility R) override {
-        outs() << "materializing\n";
         SPECIALIZE->setValue(arg);
         SPECIALIZE_TRANSFORM->emit(std::move(R), std::move(tsm));
     }
@@ -185,13 +192,14 @@ JITTargetAddress CompileFunction(Function* function, JITTargetAddress arg) {
     CloneFunctionInto(copy, function, vmap, true, returns);
 
     ExecutionSession& ES = DYLIB->getExecutionSession();
-    auto def = DYLIB->define(std::make_unique<SpecializationMaterializer>(mangled, std::move(tsm), arg));
+    auto def = DYLIB->define(std::make_unique<SpecializationMaterializer>((*MANGLE)(mangled), std::move(tsm), arg));
     if (def) {
         errs() << "Failed to define specialized function in dylib.\n";
         return 0;
     }
 
     auto sym = ES.lookup({DYLIB}, (*MANGLE)(mangled));
+    sym = ES.lookup({DYLIB}, (*MANGLE)(mangled));
     if (!sym) {
         errs() << "Failed to specialize function " << function->getName() << " for argument " << arg << "\n";
         return 0;
@@ -200,6 +208,8 @@ JITTargetAddress CompileFunction(Function* function, JITTargetAddress arg) {
 }
 
 // Specializes the provided function on a particular argument.
+JITTargetAddress SpecializationPass::arg;
+
 SpecializationPass::SpecializationPass(): FunctionPass(pid) {}
 
 void SpecializationPass::setValue(llvm::JITTargetAddress arg_in) {
@@ -211,10 +221,10 @@ bool SpecializationPass::runOnFunction(Function &f) {
 
     Value* fnarg = nullptr;
     fnarg = dyn_cast<Value>(f.arg_begin());
-    ConstantInt* const_val = llvm::ConstantInt::get(f.getContext(), llvm::APInt(/*nbits*/fnarg->getType()->getScalarSizeInBits(), arg, /*bool*/false));
+    ConstantInt* const_val = llvm::ConstantInt::get(f.getContext(), llvm::APInt(fnarg->getType()->getScalarSizeInBits(), arg, false));
     fnarg->replaceAllUsesWith(const_val);
-    outs() << "Specialized function " << f.getName() << ":\n";
-    f.print(outs());
+    // outs() << "Specialized function " << f.getName() << ":\n";
+    // f.print(outs());
     return true;
 }
 
@@ -230,13 +240,17 @@ bool InstrumentationPass::runOnFunction(Function &f) {
                 CallInst& call = (CallInst&)inst;
                 int argidx;
                 if (call.getCalledFunction() 
-                    && symbols.find(call.getCalledFunction()->getName()) != symbols.end()
+                    && symbols.find(call.getCalledFunction()->getName().str()) != symbols.end()
                     && (argidx = findSpecializedArg(call.getCalledFunction())) > -1) {
                     FunctionType* fnt = call.getCalledFunction()->getFunctionType();
+                    auto it = symbols.find(call.getCalledFunction()->getName().str());
+                    Constant* nameConst = ConstantInt::get(Type::getInt64Ty(ctx), APInt(64, (uint64_t)it->c_str()));
+                    Instruction* str = BitCastInst::Create(Instruction::CastOps::BitCast, nameConst, Type::getInt8PtrTy(ctx));
                     Instruction* orig = BitCastInst::Create(Instruction::CastOps::SExt, call.getCalledFunction(), Type::getInt64Ty(ctx));
                     Instruction* arg = BitCastInst::Create(Instruction::CastOps::SExt, call.getArgOperand(argidx), Type::getInt64Ty(ctx));
-                    Instruction* rawchosen = CallInst::Create(JIT_RESOLVE_FN->getFunctionType(), JIT_RESOLVE_FN, { orig, arg }, "");
+                    Instruction* rawchosen = CallInst::Create(JIT_RESOLVE_FN->getFunctionType(), JIT_RESOLVE_FN, { orig, arg, str });
                     Instruction* chosen = BitCastInst::Create(Instruction::CastOps::BitCast, rawchosen, PointerType::get(fnt, 0));
+                    str->insertBefore(&call);
                     orig->insertBefore(&call);
                     arg->insertBefore(&call);
                     rawchosen->insertBefore(&call);

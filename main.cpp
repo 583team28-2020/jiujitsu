@@ -19,6 +19,10 @@
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/Constants.h>
+#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Utils.h"
+#include "llvm/Transforms/Scalar/GVN.h"
 #include "specializer.h"
 
 
@@ -47,22 +51,28 @@ public:
 namespace orc {
 
 class CustomObjectLayer : public RTDyldObjectLinkingLayer {
+  static const object::ObjectFile* objptr;
+
   static void onLoaded(VModuleKey, const object::ObjectFile& obj,
                          const RuntimeDyld::LoadedObjectInfo& info) {
+    objptr = &obj;
     for (const auto& sym : obj.symbols()) {
       auto sec = cantFail(sym.getSection());
       if (sec != obj.section_end()) {
         uint64_t sectionAddr = info.getSectionLoadAddress(*sec);
-        outs() << " - loaded " << cantFail(sym.getName()) << " : " << (void*)(sectionAddr + sym.getValue()) << "\n";
+        outs() << " - loaded " << cantFail(sym.getName()) << " : " << (void*)(sectionAddr + cantFail(sym.getValue())) << "\n";
       }
     }
   }
+
 public:
   CustomObjectLayer(ExecutionSession& ES, GetMemoryManagerFunction fn):
     RTDyldObjectLinkingLayer(ES, fn) {
     setNotifyLoaded(onLoaded);
   }
 };
+
+const object::ObjectFile* CustomObjectLayer::objptr = nullptr;
 
 class JIT {
 private:
@@ -73,7 +83,7 @@ private:
   DataLayout DL;
   MangleAndInterner Mangle;
 
-  CustomObjectLayer ObjectLayer;
+  RTDyldObjectLinkingLayer ObjectLayer;
   IRCompileLayer CompileLayer, SpecializeCompileLayer;
   IRTransformLayer TransformLayer, SpecializeTransformLayer;
   CompileOnDemandLayer CODLayer;
@@ -116,7 +126,7 @@ public:
         LCM(std::move(lcm)),
         Ctx(std::make_unique<LLVMContext>()),
         CODLayer(*this->ES, TransformLayer, *LCM, createLocalIndirectStubsManagerBuilder(triple)),
-        MainJD(this->ES->createJITDylib("main")) {
+        MainJD(cantFail(this->ES->createJITDylib("main"))) {
     MainJD.addGenerator(
         cantFail(DynamicLibrarySearchGenerator::GetForCurrentProcess('_')));
     SymbolMap syms;
@@ -181,7 +191,7 @@ using namespace llvm::orc;
 using namespace llvm;
 
 int main(int argc, char** argv) {
-    ::llvm::DebugFlag = true;
+    // ::llvm::DebugFlag = true;
     InitializeNativeTarget();
     InitializeNativeTargetAsmPrinter();
 
@@ -199,7 +209,7 @@ int main(int argc, char** argv) {
       errs() << "Error adding module.\n";
       return 1;
     }
-    LogSymbols(outs());
+    // LogSymbols(outs());
     auto* main = (int(*)(int, char*[]))jit->lookup("main").get().getAddress();
 
     char args[] = "<main>";
