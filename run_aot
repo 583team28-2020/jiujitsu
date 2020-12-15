@@ -1,0 +1,9 @@
+OLD_NAME=$1
+NEW_NAME=${OLD_NAME%.c}
+clang -O3 $1 -o $NEW_NAME
+touch tmp
+for i in {1..10}; do
+    (time ./$NEW_NAME) &>> tmp
+done
+cat tmp | grep "real"
+rm tmp $NEW_NAME

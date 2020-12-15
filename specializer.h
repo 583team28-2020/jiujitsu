@@ -22,7 +22,7 @@
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/Constants.h>
 
-#define SPECIALIZATION_THRESHOLD 1
+#define SPECIALIZATION_THRESHOLD 100LU
 
 void AddDebugFlag(llvm::StringRef str);
 bool IsDebugFlag(llvm::StringRef str);
@@ -54,6 +54,9 @@ extern "C" llvm::JITTargetAddress JITResolveCall(llvm::JITTargetAddress fn, llvm
 
 // Adds JIT implementation functions to a module.
 void DeclareInternalFunctions(llvm::LLVMContext& ctx, llvm::Module* module);
+
+// Sets global source module. This contains LLVM IR before any optimizations are applied.
+void SetSourceModule(llvm::orc::ThreadSafeModule&& tsm);
 
 // Adds JIT implementation functions to dynamic linker.
 void AddInternalFunctions(llvm::orc::MangleAndInterner& mangle, llvm::orc::SymbolMap& map);

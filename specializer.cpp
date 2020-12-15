@@ -13,7 +13,7 @@ using namespace llvm::orc;
 using namespace std;
 
 static unordered_set<string> symbols;
-static unordered_map<uint64_t, intmap> func_counter;
+static intmap func_counter;
 static unordered_map<string, Function*> function_ir;
 static unordered_set<string> debug_flags;
 
@@ -37,6 +37,12 @@ void TrackSymbol(llvm::StringRef str) {
     symbols.insert(str.str());
 }
 
+ThreadSafeModule SRC;
+
+void SetSourceModule(ThreadSafeModule&& tsm) {
+    SRC = move(tsm);
+}
+
 // Defines a function for a particular name.
 void DefineFunction(llvm::StringRef str, llvm::Function* fn) {
     function_ir[str.str()] = fn;
@@ -57,14 +63,21 @@ static SpecializationPass* SPECIALIZE = nullptr;
 // Note that by reusing the count to store the specialized function pointer, we lose the ability to
 // profile functions that are already specialized. However, this allows us to implement all of our
 // lookup tables as simple int-to-int maps, which permits for optimization.
+static uint64_t count;
 extern "C" JITTargetAddress JITResolveCall(JITTargetAddress fn, JITTargetAddress arg, const char* name) {
-    // outs() << "Called function at address " << (void*)fn << " with specialized argument " << arg << "\n";
-
-    intmap& curr_func = func_counter[fn];
-    intmap::const_iterator curr_elm = curr_func.find(arg);
+    auto it = func_counter.find(fn);
+    intmap* curr_func;
+    if (it == func_counter.end()) {
+        intmap* newmap = new intmap;
+        func_counter.emplace(fn, (uint64_t)newmap);
+        curr_func = newmap;
+    }
+    else curr_func = (intmap*)(*it).second;
+    
+    auto curr_elm = curr_func->find(arg);
     
     uint64_t num_calls;
-    if (curr_elm == curr_func.end()) {
+    if (curr_elm == curr_func->end()) {
         num_calls = 1;
     } else {
         // if optimized, run that instead
@@ -76,17 +89,20 @@ extern "C" JITTargetAddress JITResolveCall(JITTargetAddress fn, JITTargetAddress
 
     // param used a lot, optimize it and use it
     if (num_calls >= SPECIALIZATION_THRESHOLD) {
-        auto it = function_ir.find(name);
-        if (it != function_ir.end()) {
-            num_calls = fn = CompileFunction(function_ir[name], arg);
-            if (!fn) {
-                DYLIB->dump(errs());
-                errs() << "Failed to compile function!\n";
+        if (IsDebugFlag("-no-spec")) num_calls = 0;
+        else {
+            auto it = function_ir.find(name);
+            if (it != function_ir.end()) {
+                num_calls = fn = CompileFunction(function_ir[name], arg);
+                if (!fn) {
+                    DYLIB->dump(errs());
+                    errs() << "Failed to compile function!\n";
+                }
             }
         }
     }
     
-    curr_func.emplace(arg, num_calls);
+    curr_func->emplace(arg, num_calls);
     
     return fn;
 }
@@ -143,7 +159,6 @@ llvm::Expected<llvm::orc::ThreadSafeModule> specializeModule(llvm::orc::ThreadSa
     FPM->doInitialization();
     for (auto &F : *M.getModuleUnlocked()) {
       FPM->run(F);
-      F.print(outs());
     }
 
     return M;
@@ -204,7 +219,8 @@ JITTargetAddress CompileFunction(Function* function, JITTargetAddress arg) {
     ExecutionSession& ES = DYLIB->getExecutionSession();
     auto def = DYLIB->define(std::make_unique<SpecializationMaterializer>((*MANGLE)(mangled), std::move(tsm), arg));
     if (def) {
-        errs() << "Failed to define specialized function in dylib.\n";
+        errs() << "Failed to define specialized function " << mangled << " in dylib.\n";
+        ES.reportError(std::move(def));
         return 0;
     }
 

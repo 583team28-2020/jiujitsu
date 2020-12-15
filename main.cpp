@@ -98,7 +98,14 @@ private:
     auto FPM = std::make_unique<legacy::FunctionPassManager>(M.getModuleUnlocked());
 
     // Add some optimizations.
-    FPM->add(new InstrumentationPass());
+    if (!IsDebugFlag("-no-inst")) FPM->add(new InstrumentationPass());
+    FPM->add(createCFGSimplificationPass());
+    FPM->add(createPromoteMemoryToRegisterPass());
+    FPM->add(createGVNPass());
+    FPM->add(createReassociatePass());
+    FPM->add(createConstantPropagationPass());
+    FPM->add(createInstructionCombiningPass());
+    FPM->add(createDeadCodeEliminationPass());
     FPM->doInitialization();
 
     // Run the optimizations over all functions in the module being added to
@@ -167,16 +174,12 @@ public:
 
   void addLibrary(const char* fileName) {
     MainJD.addGenerator(cantFail(
-      DynamicLibrarySearchGenerator::Load(fileName, DL.getGlobalPrefix(), [](auto sym) -> bool { return true; })));
+      DynamicLibrarySearchGenerator::Load(fileName, DL.getGlobalPrefix())));
   }
 
   const DataLayout &getDataLayout() const { return DL; }
 
   Error addModule(ThreadSafeModule&& TSM) {
-    for (auto& fn : TSM.getModuleUnlocked()->getFunctionList()) {
-      TrackSymbol(fn.getName());
-      DefineFunction(fn.getName(), &fn);
-    }
     InitSpecializer(&MainJD, &SpecializeTransformLayer, TSC);
     return CODLayer.add(MainJD, std::move(TSM));
   }
@@ -197,6 +200,8 @@ static std::unordered_set<std::string> valid_flags = {
   "-log-spec", // log specialized IR
   "-dumpjd", // dump jitdylib contents after compilation
   "-dbgloads", // log output when symbols are loaded into an object
+  "-no-inst", // disable instrumentation
+  "-no-spec", // disable specialization
 };
 
 void printUsage() {
@@ -205,6 +210,8 @@ void printUsage() {
   outs() << " -log-spec : Log specialized IR.\n";
   outs() << " -dumpjd : Dump JITDylib after compiling a specialized function.\n";
   outs() << " -dbgloads : Log output when symbols are loaded.\n";
+  outs() << " -no-inst : Disable instrumentation. Effectively disables specialization.\n";
+  outs() << " -no-spec : Disable specialization. Still incurs profiling overhead.\n";
 }
 
 int main(int argc, char** argv) {
@@ -227,18 +234,26 @@ int main(int argc, char** argv) {
     TSC = ThreadSafeContext(std::move(std::make_unique<LLVMContext>()));
     SMDiagnostic error;
     auto module = parseIRFile(argv[1], error, *TSC.getContext());
+    auto src_module = parseIRFile(argv[1], error, *TSC.getContext());
     DeclareInternalFunctions(*TSC.getContext(), module.get());
+    DeclareInternalFunctions(*TSC.getContext(), src_module.get());
     auto tsm = std::make_unique<ThreadSafeModule>(move(module), TSC);
+    
+    for (auto& fn : src_module->getFunctionList()) {
+      TrackSymbol(fn.getName());
+      DefineFunction(fn.getName(), &fn);
+    }
+    SetSourceModule({ move(src_module), TSC });
 
     auto optionaljit = JIT::Create();
     if (!optionaljit)
       outs() << optionaljit.takeError() << "\n";
     auto jit = move(optionaljit.get());
+    jit->addLibrary("/usr/lib/x86_64-linux-gnu/libc.so.6");
     if (Error e = jit->addModule(std::move(*tsm))) {
       errs() << "Error adding module.\n";
       return 1;
     }
-    // LogSymbols(outs());
     auto* main = (int(*)(int, char*[]))jit->lookup("main").get().getAddress();
 
     char args[] = "<main>";
