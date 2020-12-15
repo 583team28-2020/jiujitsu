@@ -1,0 +1,4 @@
+OLD_NAME=$1
+NEW_NAME=${OLD_NAME%.c}.bc
+clang -emit-llvm -c $1 -o $NEW_NAME
+./jiujitsu $NEW_NAME -log-inst -log-spec

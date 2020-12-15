@@ -1,4 +1,5 @@
 .vscode/
 jiujitsu
 *.o
+*.bc
 hash_test*

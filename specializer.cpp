@@ -15,6 +15,15 @@ using namespace std;
 static unordered_set<string> symbols;
 static unordered_map<uint64_t, intmap> func_counter;
 static unordered_map<string, Function*> function_ir;
+static unordered_set<string> debug_flags;
+
+void AddDebugFlag(StringRef str) {
+    debug_flags.insert(str.str());
+}
+
+bool IsDebugFlag(StringRef str) {
+    return debug_flags.find(str.str()) != debug_flags.end();
+}
 
 // Logs all symbols currently tracked by the specializer.
 void LogSymbols(llvm::raw_ostream& io) {
@@ -69,7 +78,7 @@ extern "C" JITTargetAddress JITResolveCall(JITTargetAddress fn, JITTargetAddress
     if (num_calls >= SPECIALIZATION_THRESHOLD) {
         auto it = function_ir.find(name);
         if (it != function_ir.end()) {
-            num_calls = fn = CompileFunction(function_ir["fn"], arg);
+            num_calls = fn = CompileFunction(function_ir[name], arg);
             if (!fn) {
                 DYLIB->dump(errs());
                 errs() << "Failed to compile function!\n";
@@ -84,7 +93,7 @@ extern "C" JITTargetAddress JITResolveCall(JITTargetAddress fn, JITTargetAddress
 
 // Adds JIT implementation functions to a module.
 void DeclareInternalFunctions(llvm::LLVMContext& ctx, Module* module) {
-    if (!JIT_RESOLVE_FN) JIT_RESOLVE_FN = Function::Create(
+    Function::Create(
         FunctionType::get(Type::getInt64Ty(ctx), { Type::getInt64Ty(ctx), Type::getInt64Ty(ctx), Type::getInt8PtrTy(ctx) }, false), 
         Function::ExternalLinkage, 
         "JITResolveCall", 
@@ -134,7 +143,7 @@ llvm::Expected<llvm::orc::ThreadSafeModule> specializeModule(llvm::orc::ThreadSa
     FPM->doInitialization();
     for (auto &F : *M.getModuleUnlocked()) {
       FPM->run(F);
-      // F.print(outs());
+      F.print(outs());
     }
 
     return M;
@@ -174,6 +183,7 @@ protected:
 JITTargetAddress CompileFunction(Function* function, JITTargetAddress arg) {
     std::string mangled = function->getName().str() + "_" + to_string((uint64_t)arg);
     ThreadSafeModule tsm(std::make_unique<Module>(mangled, *CTX.getContext()), CTX);
+    DeclareInternalFunctions(*tsm.getContext().getContext(), tsm.getModuleUnlocked());
     
     std::vector<Type*> argts;
     for (const Argument &I : function->args())
@@ -199,6 +209,13 @@ JITTargetAddress CompileFunction(Function* function, JITTargetAddress arg) {
     }
 
     auto sym = ES.lookup({DYLIB}, (*MANGLE)(mangled));
+
+    if (IsDebugFlag("-dumpjd")) {
+        outs() << "Dumping JITDylib contents\n";
+        DYLIB->dump(outs());
+        outs() << "\n";
+    }
+
     sym = ES.lookup({DYLIB}, (*MANGLE)(mangled));
     if (!sym) {
         errs() << "Failed to specialize function " << function->getName() << " for argument " << arg << "\n";
@@ -223,14 +240,23 @@ bool SpecializationPass::runOnFunction(Function &f) {
     fnarg = dyn_cast<Value>(f.arg_begin());
     ConstantInt* const_val = llvm::ConstantInt::get(f.getContext(), llvm::APInt(fnarg->getType()->getScalarSizeInBits(), arg, false));
     fnarg->replaceAllUsesWith(const_val);
-    // outs() << "Specialized function " << f.getName() << ":\n";
-    // f.print(outs());
+
+    if (IsDebugFlag("-log-spec")) {
+        outs() << "Specialized function " << f.getName() << " on argument " << arg << "\n";
+        f.print(outs());
+        outs() << "\n";
+    }
     return true;
 }
 
 // Inserts trampolines into functions. Transforms all function calls to active module functions
 // into indirect calls, using the JITResolveCall function to resolve the address prior to invocation.
 InstrumentationPass::InstrumentationPass(): FunctionPass(pid) {}
+
+bool InstrumentationPass::doInitialization(Module &m) {
+    resolveFn = m.getFunction("JITResolveCall");
+    return resolveFn;
+}
 
 bool InstrumentationPass::runOnFunction(Function &f) {
     LLVMContext& ctx = f.getContext();
@@ -248,7 +274,7 @@ bool InstrumentationPass::runOnFunction(Function &f) {
                     Instruction* str = BitCastInst::Create(Instruction::CastOps::BitCast, nameConst, Type::getInt8PtrTy(ctx));
                     Instruction* orig = BitCastInst::Create(Instruction::CastOps::SExt, call.getCalledFunction(), Type::getInt64Ty(ctx));
                     Instruction* arg = BitCastInst::Create(Instruction::CastOps::SExt, call.getArgOperand(argidx), Type::getInt64Ty(ctx));
-                    Instruction* rawchosen = CallInst::Create(JIT_RESOLVE_FN->getFunctionType(), JIT_RESOLVE_FN, { orig, arg, str });
+                    Instruction* rawchosen = CallInst::Create(resolveFn->getFunctionType(), resolveFn, { orig, arg, str });
                     Instruction* chosen = BitCastInst::Create(Instruction::CastOps::BitCast, rawchosen, PointerType::get(fnt, 0));
                     str->insertBefore(&call);
                     orig->insertBefore(&call);
@@ -259,6 +285,11 @@ bool InstrumentationPass::runOnFunction(Function &f) {
                 }
             }
         }
+    }
+    if (IsDebugFlag("-log-inst")) {
+        outs() << "Added instrumentation to function " << f.getName() << "\n";
+        f.print(outs());
+        outs() << "\n";
     }
     return true;
 }

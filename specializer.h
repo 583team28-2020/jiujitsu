@@ -22,7 +22,10 @@
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/Constants.h>
 
-#define SPECIALIZATION_THRESHOLD 100
+#define SPECIALIZATION_THRESHOLD 1
+
+void AddDebugFlag(llvm::StringRef str);
+bool IsDebugFlag(llvm::StringRef str);
 
 // Logs all symbols currently tracked by the specializer.
 void LogSymbols(llvm::raw_ostream& io);
@@ -75,7 +78,9 @@ public:
 // into indirect calls, using the JITResolveCall function to resolve the address prior to invocation.
 class InstrumentationPass : public llvm::FunctionPass {
     char pid = 76;
+    llvm::Function* resolveFn = nullptr;
 public:
     InstrumentationPass();
+    bool doInitialization(llvm::Module &f) override;
     bool runOnFunction(llvm::Function &f) override;
 };

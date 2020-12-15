@@ -55,12 +55,14 @@ class CustomObjectLayer : public RTDyldObjectLinkingLayer {
 
   static void onLoaded(VModuleKey, const object::ObjectFile& obj,
                          const RuntimeDyld::LoadedObjectInfo& info) {
-    objptr = &obj;
-    for (const auto& sym : obj.symbols()) {
-      auto sec = cantFail(sym.getSection());
-      if (sec != obj.section_end()) {
-        uint64_t sectionAddr = info.getSectionLoadAddress(*sec);
-        outs() << " - loaded " << cantFail(sym.getName()) << " : " << (void*)(sectionAddr + cantFail(sym.getValue())) << "\n";
+    if (IsDebugFlag("-dbgloads")) {
+      objptr = &obj;
+      for (const auto& sym : obj.symbols()) {
+        auto sec = cantFail(sym.getSection());
+        if (sec != obj.section_end()) {
+          uint64_t sectionAddr = info.getSectionLoadAddress(*sec);
+          outs() << " - loaded " << cantFail(sym.getName()) << " : " << (void*)(sectionAddr + cantFail(sym.getValue())) << "\n";
+        }
       }
     }
   }
@@ -83,7 +85,7 @@ private:
   DataLayout DL;
   MangleAndInterner Mangle;
 
-  RTDyldObjectLinkingLayer ObjectLayer;
+  CustomObjectLayer ObjectLayer;
   IRCompileLayer CompileLayer, SpecializeCompileLayer;
   IRTransformLayer TransformLayer, SpecializeTransformLayer;
   CompileOnDemandLayer CODLayer;
@@ -190,7 +192,34 @@ public:
 using namespace llvm::orc;
 using namespace llvm;
 
+static std::unordered_set<std::string> valid_flags = {
+  "-log-inst", // log instrumented IR
+  "-log-spec", // log specialized IR
+  "-dumpjd", // dump jitdylib contents after compilation
+  "-dbgloads", // log output when symbols are loaded into an object
+};
+
+void printUsage() {
+  outs() << "Usage: ./jiujitsu <bitcode file> [flags...]\n";
+  outs() << " -log-inst : Log instrumented IR.\n";
+  outs() << " -log-spec : Log specialized IR.\n";
+  outs() << " -dumpjd : Dump JITDylib after compiling a specialized function.\n";
+  outs() << " -dbgloads : Log output when symbols are loaded.\n";
+}
+
 int main(int argc, char** argv) {
+    if (argc < 2) {
+      printUsage();
+      return 1;
+    }
+
+    for (int i = 2; i < argc; i ++) {
+      if (valid_flags.find(argv[i]) != valid_flags.end()) AddDebugFlag(argv[i]);
+      else {
+        printUsage();
+        return 1;
+      }
+    }
     // ::llvm::DebugFlag = true;
     InitializeNativeTarget();
     InitializeNativeTargetAsmPrinter();
